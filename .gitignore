@@ -1,0 +1,5 @@
+# local simulation state
+.data/
+*.tmp
+# binaries
+scheduler
