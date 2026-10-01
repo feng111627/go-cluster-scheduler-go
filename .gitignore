@@ -1,0 +1,4 @@
+# local demo artifacts
+cluster-state.json
+cluster-state.json.bak
+*.tmp
