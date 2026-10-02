@@ -2,3 +2,5 @@
 cluster-state.json
 cluster-state.json.bak
 *.tmp
+cluster-maintenance-state.json
+cluster-maintenance-state.json.bak

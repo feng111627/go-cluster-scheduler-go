@@ -19,20 +19,39 @@ import (
 
 func main() {
 	stateFile := flag.String("state-file", "cluster-state.json", "path to the durable state file")
+	scenario := flag.String("scenario", "default", "demo scenario: default (scheduling/failover) or maintenance (planned drain)")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "[scheduler] ", log.LstdFlags|log.Lmicroseconds)
 
-	// A demo only makes sense from an empty state; move the old file aside.
-	if _, err := os.Stat(*stateFile); err == nil {
-		backup := *stateFile + ".bak"
-		if err := os.Rename(*stateFile, backup); err == nil {
-			logger.Printf("existing state moved aside: %s", backup)
+	if *scenario == "maintenance" {
+		// The maintenance demo is self-contained and uses its own state file by
+		// default, so it never collides with the default-scenario artifacts.
+		file := *stateFile
+		if *stateFile == "cluster-state.json" {
+			file = "cluster-maintenance-state.json"
 		}
+		moveAsideIfExists(file, logger)
+		if err := runMaintenanceDemo(file, logger); err != nil {
+			logger.Fatalf("maintenance demo failed: %v", err)
+		}
+		return
 	}
+
+	// A demo only makes sense from an empty state; move the old file aside.
+	moveAsideIfExists(*stateFile, logger)
 
 	if err := run(*stateFile, logger); err != nil {
 		logger.Fatalf("demo failed: %v", err)
+	}
+}
+
+func moveAsideIfExists(file string, logger *log.Logger) {
+	if _, err := os.Stat(file); err == nil {
+		backup := file + ".bak"
+		if err := os.Rename(file, backup); err == nil {
+			logger.Printf("existing state moved aside: %s", backup)
+		}
 	}
 }
 

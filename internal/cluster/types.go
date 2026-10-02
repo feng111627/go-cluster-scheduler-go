@@ -56,10 +56,24 @@ const (
 	PhasePending PodPhase = "Pending"
 	// PhaseRunning is bound to a node currently considered healthy.
 	PhaseRunning PodPhase = "Running"
-	// PhaseRescheduling was evicted from a lost node and awaits a new binding.
+	// PhaseRescheduling was evicted from a lost node or drained from a node
+	// under planned maintenance and awaits a new binding.
 	PhaseRescheduling PodPhase = "Rescheduling"
 	// PhaseFailed is a terminally failed pod.
 	PhaseFailed PodPhase = "Failed"
+)
+
+// WaitReason distinguishes WHY an unbound (Rescheduling) pod is waiting, so a
+// planned-maintenance drain is never confused with an unplanned node loss.
+type WaitReason string
+
+const (
+	// WaitReasonNodeLost: pod was evicted because its node stayed unreachable
+	// beyond the eviction grace period (unplanned failure).
+	WaitReasonNodeLost WaitReason = "NodeLost"
+	// WaitReasonDraining: pod was moved off a node that an operator put under
+	// planned maintenance, and no other healthy node currently fits it.
+	WaitReasonDraining WaitReason = "DrainingForMaintenance"
 )
 
 // Node is a simulated worker machine.
@@ -76,6 +90,12 @@ type Node struct {
 	// Evicted means pods were already moved off this (long-lost) node; it
 	// makes eviction idempotent across repeated detection passes.
 	Evicted bool `json:"evicted,omitempty"`
+	// UnderMaintenance is the operator-issued, durable "planned drain" flag.
+	// While set, the node receives no new placements and Running pods are
+	// migrated off it. It is independent of Ready/heartbeats (so it survives a
+	// restart and does not fight the failure detector) and is cleared only by
+	// an explicit maintenance-end call.
+	UnderMaintenance bool `json:"underMaintenance,omitempty"`
 }
 
 // Pod is a single simulated pod instance.
@@ -89,9 +109,12 @@ type Pod struct {
 	Tolerations []Toleration `json:"tolerations,omitempty"`
 	Phase       PodPhase     `json:"phase"`
 	NodeName    string       `json:"nodeName,omitempty"`
-	// OriginNode records the node a Rescheduling pod was evicted from.
+	// OriginNode records the node a Rescheduling pod was evicted/drained from.
 	OriginNode string    `json:"originNode,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
+	// WaitReason records why a Rescheduling pod is waiting (node loss vs.
+	// planned maintenance drain); cleared on binding.
+	WaitReason WaitReason `json:"waitReason,omitempty"`
 	// Generation bumps on every state transition; helps make decisions explainable.
 	Generation int `json:"generation"`
 }

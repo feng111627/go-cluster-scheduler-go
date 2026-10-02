@@ -14,6 +14,8 @@ import (
 type Reason string
 
 const (
+	// ReasonNodeUnderMaintenance: node is cordoned for planned maintenance.
+	ReasonNodeUnderMaintenance Reason = "NodeUnderMaintenance"
 	// ReasonNodeNotReady: node is not Ready (down / unreachable).
 	ReasonNodeNotReady Reason = "NodeNotReady"
 	// ReasonInsufficientCPU: node has insufficient allocatable CPU.
@@ -44,8 +46,8 @@ func (e *ScheduleError) Error() string {
 
 // AggregateReason returns a deterministic, distinguishable summary of the
 // failure class in a fixed precedence:
-// TaintNotTolerated > InsufficientCPU > InsufficientMemory > NodeNotReady,
-// or "NoNodes" when there are no candidate nodes at all.
+// TaintNotTolerated > InsufficientCPU > InsufficientMemory > NodeNotReady >
+// NodeUnderMaintenance, or "NoNodes" when there are no candidate nodes at all.
 func (e *ScheduleError) AggregateReason() Reason {
 	has := func(r Reason) bool {
 		for _, f := range e.Failures {
@@ -64,6 +66,8 @@ func (e *ScheduleError) AggregateReason() Reason {
 		return ReasonInsufficientMemory
 	case has(ReasonNodeNotReady):
 		return ReasonNodeNotReady
+	case has(ReasonNodeUnderMaintenance):
+		return ReasonNodeUnderMaintenance
 	default:
 		return Reason("NoNodes")
 	}
@@ -124,10 +128,16 @@ func tolerates(tols []cluster.Toleration, t cluster.Taint) bool {
 	return false
 }
 
-// feasible checks node readiness, resources and taints in a fixed order and
-// returns the first rejection reason, or "" if the node is feasible. The
-// fixed order makes the verdict per node unambiguous and explainable.
+// feasible checks node maintenance gate, readiness, resources and taints in a
+// fixed order and returns the first rejection reason, or "" if the node is
+// feasible. The fixed order makes the verdict per node unambiguous and
+// explainable. The maintenance gate is checked first: an operator cordon is an
+// explicit, durable intent that must hold even if the node's heartbeats later
+// go stale during the maintenance window.
 func feasible(node *cluster.Node, req cluster.Resources, tol []cluster.Toleration) (Reason, string) {
+	if node.UnderMaintenance {
+		return ReasonNodeUnderMaintenance, "node is cordoned (under planned maintenance)"
+	}
 	if !node.Ready {
 		return ReasonNodeNotReady, "node is not Ready"
 	}
@@ -234,6 +244,7 @@ func (sc *Scheduler) PlaceInState(st *cluster.State, podUID string) error {
 	chosen.node.Used = chosen.node.Used.Add(pod.Requests)
 	pod.NodeName = chosen.node.Name
 	pod.OriginNode = ""
+	pod.WaitReason = "" // re-bound: the wait reason (loss/drain) no longer applies
 	pod.Phase = cluster.PhaseRunning
 	pod.Generation++
 

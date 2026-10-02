@@ -50,6 +50,26 @@ func (s *Store) RemoveNode(name string) error {
 	})
 }
 
+// SetMaintenanceFlag durably toggles a node's planned-maintenance flag. It
+// returns changed=false when the flag already had the requested value, so
+// repeated/concurrent calls are idempotent. The flag alone only stops new
+// placements; live-pod migration is performed by the controller's drain.
+func (s *Store) SetMaintenanceFlag(name string, on bool) (changed bool, err error) {
+	err = s.Update(func(st *State) error {
+		n := st.Nodes[name]
+		if n == nil {
+			return fmt.Errorf("unknown node: %s", name)
+		}
+		if n.UnderMaintenance == on {
+			return nil
+		}
+		n.UnderMaintenance = on
+		changed = true
+		return nil
+	})
+	return changed, err
+}
+
 // UpsertDeployment registers or replaces the desired state for a deployment.
 func (s *Store) UpsertDeployment(d *Deployment) error {
 	return s.Update(func(st *State) error {

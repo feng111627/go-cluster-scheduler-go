@@ -190,6 +190,52 @@ func TestSchedule_NotReadyNode(t *testing.T) {
 	}
 }
 
+// TestSchedule_MaintenanceGateRejects verifies that a cordoned (planned
+// maintenance) node rejects new placements with a reason distinct from a dead
+// node — even while it still has heartbeats and full free capacity.
+func TestSchedule_MaintenanceGateRejects(t *testing.T) {
+	st := newTestStore(t)
+	sc := New(st, testutil.Log{T: t})
+	addNode(t, st, &cluster.Node{Name: "drained", Capacity: cluster.Resources{CPU: q(8000), Memory: 8192}, Ready: true, UnderMaintenance: true})
+	addPending(t, st, &cluster.Pod{UID: "p", Name: "p", Requests: cluster.Resources{CPU: q(100), Memory: 64}})
+	err := sc.ScheduleOne("p")
+	var se *ScheduleError
+	if !errors.As(err, &se) || se.Failures[0].Reason != ReasonNodeUnderMaintenance {
+		t.Fatalf("want NodeUnderMaintenance, got %v", err)
+	}
+	if got := se.AggregateReason(); got != ReasonNodeUnderMaintenance {
+		t.Fatalf("aggregate = %s, want NodeUnderMaintenance", got)
+	}
+	t.Log(testutil.Describe("maintenance rejection evidence", "node", se.Failures[0].Node, "detail", se.Failures[0].Detail))
+
+	// With one cordoned and one healthy node, the healthy one is chosen and
+	// the verdict per node stays explainable.
+	addNode(t, st, &cluster.Node{Name: "healthy", Capacity: cluster.Resources{CPU: q(8000), Memory: 8192}, Ready: true})
+	addPending(t, st, &cluster.Pod{UID: "p2", Name: "p2", Requests: cluster.Resources{CPU: q(100), Memory: 64}})
+	if err := sc.ScheduleOne("p2"); err != nil {
+		t.Fatalf("ScheduleOne p2: %v", err)
+	}
+	st.View(func(s *cluster.State) {
+		if got := s.Pods["p2"].NodeName; got != "healthy" {
+			t.Fatalf("p2 landed on %q, want healthy (maintenance node never receives placements)", got)
+		}
+	})
+
+	// Uncordon: the same node can admit pods again.
+	if _, err := st.SetMaintenanceFlag("drained", false); err != nil {
+		t.Fatal(err)
+	}
+	addPending(t, st, &cluster.Pod{UID: "p3", Name: "p3", Requests: cluster.Resources{CPU: q(100), Memory: 64}})
+	if err := sc.ScheduleOne("p3"); err != nil {
+		t.Fatalf("ScheduleOne p3 after uncordon: %v", err)
+	}
+	st.View(func(s *cluster.State) {
+		if got := s.Pods["p3"].NodeName; got != "drained" {
+			t.Fatalf("p3 landed on %q, want drained (empty node has most remaining CPU)", got)
+		}
+	})
+}
+
 // TestSchedule_ConcurrentNoOversell hammers one capacity-3 node with 10 pods
 // scheduled concurrently. Exactly 3 must bind and node usage must never exceed
 // capacity (run with -race). All evaluation+binding happens inside one

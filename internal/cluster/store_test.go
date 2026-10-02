@@ -90,6 +90,61 @@ func TestStore_ConcurrentUpdatesSerializes(t *testing.T) {
 	})
 }
 
+// TestStore_MaintenanceFlagPersists covers the durable planned-maintenance
+// flag and the distinguishable wait reason: both must survive a reload so a
+// restart during a maintenance window "continues" rather than forgets.
+func TestStore_MaintenanceFlagPersists(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "state.json")
+	s1, err := NewStore(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.UpsertNode(&Node{Name: "n1", Capacity: Resources{CPU: 4000, Memory: 512}, Ready: true}); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := s1.SetMaintenanceFlag("n1", true)
+	if err != nil || !changed {
+		t.Fatalf("set on: changed=%v err=%v", changed, err)
+	}
+	if err := s1.Update(func(st *State) error {
+		st.Pods["p1"] = &Pod{UID: "p1", Phase: PhaseRescheduling, OriginNode: "n1", WaitReason: WaitReasonDraining}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Idempotent: setting the same value again reports no transition.
+	if changed, err := s1.SetMaintenanceFlag("n1", true); err != nil || changed {
+		t.Fatalf("re-set on: changed=%v err=%v, want no-op", changed, err)
+	}
+
+	s2, err := NewStore(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2.View(func(st *State) {
+		if !st.Nodes["n1"].UnderMaintenance {
+			t.Fatal("maintenance flag must survive restart (cordon cannot be forgotten)")
+		}
+		if st.Pods["p1"].WaitReason != WaitReasonDraining {
+			t.Fatalf("wait reason = %q, want DrainingForMaintenance", st.Pods["p1"].WaitReason)
+		}
+	})
+
+	// Turning it off is itself persisted.
+	if changed, err := s2.SetMaintenanceFlag("n1", false); err != nil || !changed {
+		t.Fatalf("set off: changed=%v err=%v", changed, err)
+	}
+	s3, err := NewStore(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3.View(func(st *State) {
+		if st.Nodes["n1"].UnderMaintenance {
+			t.Fatal("maintenance flag must stay cleared after reload")
+		}
+	})
+}
+
 var errBoom = newSentinel("boom")
 
 type sentinel string

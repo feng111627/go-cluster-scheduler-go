@@ -242,6 +242,17 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 		for _, name := range names {
 			n := st.Nodes[name]
 
+			// Planned maintenance owns this node's lifecycle while its flag is
+			// set: the failure detector must not mark it unreachable, evict it,
+			// or "heal" it. The two mechanisms are independent gates and never
+			// fight each other; stale heartbeats during the window are simply
+			// ignored and re-evaluated after maintenance ends.
+			if n.UnderMaintenance {
+				c.logger.Printf("node-failure input: node=%s skipped: under planned maintenance (failure detector hands off to drain controller)",
+					name)
+				continue
+			}
+
 			// (1) healthy so far: detect a missed heartbeat. If it is stale,
 			// fall through — the staleness may already exceed the grace
 			// period (e.g. detector itself was down), in which case this same
@@ -290,6 +301,7 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 				p.OriginNode = name
 				p.NodeName = ""
 				p.Phase = cluster.PhaseRescheduling
+				p.WaitReason = cluster.WaitReasonNodeLost
 				p.Generation++
 				moved = append(moved, p.UID)
 				evicted = append(evicted, p.UID)
