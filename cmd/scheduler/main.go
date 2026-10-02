@@ -108,9 +108,32 @@ func run(stateFile string, logger *log.Logger) error {
 	}
 	printCounts(logger, st)
 
-	// 3) node-a loses heartbeats: at first only Unreachable (grace), then evicted.
+	// 3) Planned maintenance on node-b: drain it (web-3 migrates to node-a),
+	// then bring it back and show that nothing flaps back and forth.
+	logger.Printf("==== STEP 3: planned maintenance on node-b (drain + migrate) ====")
+	drained, err := ctl.EnterMaintenance("node-b")
+	if err != nil {
+		return err
+	}
+	logger.Printf("drained pods off node-b: %v", drained)
+	if err := reconcile(ctl, "web"); err != nil {
+		return err
+	}
+	printCounts(logger, st)
+	logPodsOnNode(logger, st, "node-b") // must be empty
+
+	logger.Printf("==== STEP 4: node-b exits maintenance (rejoin, no move-back flap) ====")
+	if err := ctl.ExitMaintenance("node-b"); err != nil {
+		return err
+	}
+	if err := reconcile(ctl, "web"); err != nil {
+		return err
+	}
+	printCounts(logger, st)
+
+	// 4) node-a loses heartbeats: at first only Unreachable (grace), then evicted.
 	// Healthy nodes keep heartbeating as the virtual clock advances.
-	logger.Printf("==== STEP 3: node-a goes silent ====")
+	logger.Printf("==== STEP 5: node-a goes silent ====")
 	clk.advance(15 * time.Second) // past heartbeat timeout, within eviction grace
 	healthyHeartbeat(st, clk, "node-b", "node-c")
 	if _, err := ctl.DetectNodeFailures(); err != nil {
@@ -119,13 +142,13 @@ func run(stateFile string, logger *log.Logger) error {
 	printCounts(logger, st)
 
 	// A reconcile during the grace window does not over-create: total stays 4.
-	logger.Printf("==== STEP 4: reconcile while node-a is merely unreachable (no churn) ====")
+	logger.Printf("==== STEP 6: reconcile while node-a is merely unreachable (no churn) ====")
 	if err := reconcile(ctl, "web"); err != nil {
 		return err
 	}
 	printCounts(logger, st)
 
-	logger.Printf("==== STEP 5: node-a stays silent past grace -> eviction + reschedule ====")
+	logger.Printf("==== STEP 7: node-a stays silent past grace -> eviction + reschedule ====")
 	clk.advance(25 * time.Second) // 40s total since silence: beyond grace
 	healthyHeartbeat(st, clk, "node-b", "node-c")
 	evicted, err := ctl.DetectNodeFailures()
@@ -138,9 +161,9 @@ func run(stateFile string, logger *log.Logger) error {
 	}
 	printCounts(logger, st)
 
-	// 4) Resource insufficiency demo: a tolerated, oversized workload fills
+	// 5) Resource insufficiency demo: a tolerated, oversized workload fills
 	// node-b + node-c and then reports InsufficientCPU.
-	logger.Printf("==== STEP 6: add tolerated workload 'batch' with 20 replicas to observe InsufficientCPU ====")
+	logger.Printf("==== STEP 8: add tolerated workload 'batch' with 20 replicas to observe InsufficientCPU ====")
 	batch := &cluster.Deployment{
 		Name:      "batch",
 		Namespace: "default",
@@ -170,7 +193,7 @@ func run(stateFile string, logger *log.Logger) error {
 	printCounts(logger, st)
 
 	// 5) Restart: reload state from disk in a fresh store/controller.
-	logger.Printf("==== STEP 7: simulate process restart from %s ====", stateFile)
+	logger.Printf("==== STEP 9: simulate process restart from %s ====", stateFile)
 	st2, err := cluster.NewStore(stateFile)
 	if err != nil {
 		return err
@@ -212,6 +235,19 @@ func healthyHeartbeat(st *cluster.Store, clk *clock, nodes ...string) {
 			panic(err)
 		}
 	}
+}
+
+// logPodsOnNode prints the pods currently bound to a node (for the drain demo).
+func logPodsOnNode(logger *log.Logger, st *cluster.Store, node string) {
+	var pods []string
+	st.View(func(s *cluster.State) {
+		for uid, p := range s.Pods {
+			if p.NodeName == node {
+				pods = append(pods, uid)
+			}
+		}
+	})
+	logger.Printf("pods still on %s: %v (want empty after drain)", node, pods)
 }
 
 func printCounts(logger *log.Logger, st *cluster.Store) {

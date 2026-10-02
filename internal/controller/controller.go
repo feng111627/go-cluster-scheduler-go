@@ -242,6 +242,14 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 		for _, name := range names {
 			n := st.Nodes[name]
 
+			// Nodes under planned maintenance are deliberately out of
+			// service: their drain is handled by EnterMaintenance, and the
+			// failure detector must not double-handle them (no Unreachable
+			// flapping, no eviction) while the flag is set.
+			if n.Maintenance {
+				continue
+			}
+
 			// (1) healthy so far: detect a missed heartbeat. If it is stale,
 			// fall through — the staleness may already exceed the grace
 			// period (e.g. detector itself was down), in which case this same

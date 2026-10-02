@@ -16,6 +16,8 @@ type Reason string
 const (
 	// ReasonNodeNotReady: node is not Ready (down / unreachable).
 	ReasonNodeNotReady Reason = "NodeNotReady"
+	// ReasonNodeMaintenance: node is under planned maintenance (draining).
+	ReasonNodeMaintenance Reason = "NodeMaintenance"
 	// ReasonInsufficientCPU: node has insufficient allocatable CPU.
 	ReasonInsufficientCPU Reason = "InsufficientCPU"
 	// ReasonInsufficientMemory: node has insufficient allocatable memory.
@@ -44,8 +46,10 @@ func (e *ScheduleError) Error() string {
 
 // AggregateReason returns a deterministic, distinguishable summary of the
 // failure class in a fixed precedence:
-// TaintNotTolerated > InsufficientCPU > InsufficientMemory > NodeNotReady,
-// or "NoNodes" when there are no candidate nodes at all.
+// TaintNotTolerated > InsufficientCPU > InsufficientMemory > NodeMaintenance >
+// NodeNotReady, or "NoNodes" when there are no candidate nodes at all.
+// Resource shortages outrank NodeMaintenance so that "healthy nodes cannot
+// fit the pod" stays distinguishable from "node is deliberately drained".
 func (e *ScheduleError) AggregateReason() Reason {
 	has := func(r Reason) bool {
 		for _, f := range e.Failures {
@@ -62,6 +66,8 @@ func (e *ScheduleError) AggregateReason() Reason {
 		return ReasonInsufficientCPU
 	case has(ReasonInsufficientMemory):
 		return ReasonInsufficientMemory
+	case has(ReasonNodeMaintenance):
+		return ReasonNodeMaintenance
 	case has(ReasonNodeNotReady):
 		return ReasonNodeNotReady
 	default:
@@ -124,10 +130,14 @@ func tolerates(tols []cluster.Toleration, t cluster.Taint) bool {
 	return false
 }
 
-// feasible checks node readiness, resources and taints in a fixed order and
-// returns the first rejection reason, or "" if the node is feasible. The
-// fixed order makes the verdict per node unambiguous and explainable.
+// feasible checks maintenance mode, node readiness, resources and taints in a
+// fixed order and returns the first rejection reason, or "" if the node is
+// feasible. The fixed order makes the verdict per node unambiguous and
+// explainable.
 func feasible(node *cluster.Node, req cluster.Resources, tol []cluster.Toleration) (Reason, string) {
+	if node.Maintenance {
+		return ReasonNodeMaintenance, "node is under planned maintenance (draining)"
+	}
 	if !node.Ready {
 		return ReasonNodeNotReady, "node is not Ready"
 	}

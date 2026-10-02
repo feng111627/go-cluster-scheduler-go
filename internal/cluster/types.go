@@ -76,6 +76,13 @@ type Node struct {
 	// Evicted means pods were already moved off this (long-lost) node; it
 	// makes eviction idempotent across repeated detection passes.
 	Evicted bool `json:"evicted,omitempty"`
+	// Maintenance marks a planned, operator-initiated drain: the node rejects
+	// new placements and its pods are migrated away. Persisted, so the flag
+	// survives process restarts.
+	Maintenance bool `json:"maintenance,omitempty"`
+	// MaintenanceSince records when the node entered maintenance (for
+	// explainability and stable ordering decisions).
+	MaintenanceSince time.Time `json:"maintenanceSince,omitempty"`
 }
 
 // Pod is a single simulated pod instance.

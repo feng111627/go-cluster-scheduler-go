@@ -236,3 +236,59 @@ func TestSchedule_ConcurrentNoOversell(t *testing.T) {
 }
 
 func fmtTestUID(i int) string { return "cp" + string(rune('0'+i)) }
+
+func TestSchedule_MaintenanceNodeRejected(t *testing.T) {
+	st := newTestStore(t)
+	sc := New(st, testutil.Log{T: t})
+
+	// node-a is under planned maintenance, node-b is healthy but full.
+	addNode(t, st, &cluster.Node{Name: "node-a", Capacity: cluster.Resources{CPU: q(4000), Memory: 4096}, Ready: true, Maintenance: true})
+	addNode(t, st, &cluster.Node{Name: "node-b", Capacity: cluster.Resources{CPU: q(1000), Memory: 4096}, Ready: true})
+
+	// A small pod must go to node-b: maintenance beats capacity.
+	addPending(t, st, &cluster.Pod{UID: "p1", Name: "p1", Requests: cluster.Resources{CPU: q(1000), Memory: 512}})
+	if err := sc.ScheduleOne("p1"); err != nil {
+		t.Fatalf("ScheduleOne p1: %v", err)
+	}
+	st.View(func(s *cluster.State) {
+		if s.Pods["p1"].NodeName != "node-b" {
+			t.Fatalf("p1 bound to %q, want node-b (node-a is in maintenance)", s.Pods["p1"].NodeName)
+		}
+	})
+
+	// A second pod fits nowhere: node-a is in maintenance, node-b is full.
+	// The per-node reasons must distinguish the two, and the aggregate must
+	// surface the actionable capacity shortage.
+	addPending(t, st, &cluster.Pod{UID: "p2", Name: "p2", Requests: cluster.Resources{CPU: q(1000), Memory: 512}})
+	err := sc.ScheduleOne("p2")
+	se, ok := err.(*ScheduleError)
+	if !ok {
+		t.Fatalf("want *ScheduleError, got %v", err)
+	}
+	if se.AggregateReason() != ReasonInsufficientCPU {
+		t.Fatalf("aggregate = %s, want InsufficientCPU", se.AggregateReason())
+	}
+	reasons := map[string]Reason{}
+	for _, f := range se.Failures {
+		reasons[f.Node] = f.Reason
+	}
+	if reasons["node-a"] != ReasonNodeMaintenance || reasons["node-b"] != ReasonInsufficientCPU {
+		t.Fatalf("per-node reasons = %v, want node-a=NodeMaintenance node-b=InsufficientCPU", reasons)
+	}
+
+	// Only maintenance nodes left: aggregate is NodeMaintenance itself.
+	if err := st.Update(func(s *cluster.State) error {
+		delete(s.Nodes, "node-b")
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = sc.ScheduleOne("p2")
+	se, ok = err.(*ScheduleError)
+	if !ok {
+		t.Fatalf("want *ScheduleError, got %v", err)
+	}
+	if se.AggregateReason() != ReasonNodeMaintenance {
+		t.Fatalf("aggregate = %s, want NodeMaintenance", se.AggregateReason())
+	}
+}
