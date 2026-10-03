@@ -219,12 +219,16 @@ func (e *ReconcileError) Error() string {
 
 // DetectNodeFailures performs one failure-detection pass:
 //
-//  1. a Ready node whose last heartbeat is older than heartbeatTimeout becomes
+//  1. a node with a fresh heartbeat is (or becomes) Ready — this recovers
+//     brief flaps with zero churn AND lets a previously evicted node rejoin
+//     once it verifiably reports again (its pods were already moved, so
+//     recovery moves nothing);
+//  2. a Ready node whose heartbeat is older than heartbeatTimeout becomes
 //     unreachable (Ready=false, UnreachableSince pinned to the first miss);
-//  2. an unreachable node that heartbeats again BEFORE eviction is restored to
-//     Ready with no churn — brief flaps never evict anything;
 //  3. an unreachable node older than evictionGrace is evicted exactly once:
-//     its pods' resources are released and the pods move to Rescheduling.
+//     its pods' resources are released and the pods move to Rescheduling
+//     with WaitReason=NodeLost (distinguishable from a maintenance drain,
+//     and persisted so the distinction survives restarts).
 //
 // It returns the UIDs evicted in this pass. The caller (or the next reconcile)
 // reschedules them. At every instant the pod count is explainable: eviction
@@ -250,28 +254,36 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 				continue
 			}
 
-			// (1) healthy so far: detect a missed heartbeat. If it is stale,
-			// fall through — the staleness may already exceed the grace
-			// period (e.g. detector itself was down), in which case this same
-			// pass should both mark and evict.
-			if n.Ready {
-				if now.Sub(n.LastSeen) > c.heartbeatTimeout {
-					n.Ready = false
-					n.UnreachableSince = n.LastSeen.Add(c.heartbeatTimeout)
-					c.logger.Printf("node-failure input: node=%s lastSeen=%s staleFor=%s -> marked Unreachable (grace=%s before eviction)",
-						name, n.LastSeen.Format(time.RFC3339), now.Sub(n.LastSeen), c.evictionGrace)
-				} else {
-					continue
+			fresh := now.Sub(n.LastSeen) <= c.heartbeatTimeout
+
+			// (1) The node verifiably reports (fresh heartbeat): it IS alive,
+			// so it participates in scheduling. This also recovers nodes that
+			// were previously evicted — their pods were already moved away, so
+			// recovery itself moves nothing and cannot duplicate anything.
+			// Brief flaps (recovered before the grace period) therefore cause
+			// zero churn, and a node that comes back after eviction rejoins
+			// only through real heartbeats, never by assumption.
+			if fresh {
+				if !n.Ready || n.Evicted {
+					c.logger.Printf("node-failure input: node=%s heartbeat fresh (lastSeen=%s) -> Ready again (wasReady=%t wasEvicted=%t; no eviction, no rebuild)",
+						name, n.LastSeen.Format(time.RFC3339), n.Ready, n.Evicted)
+					n.Ready = true
+					n.UnreachableSince = time.Time{}
+					n.Evicted = false
 				}
+				continue
 			}
 
-			// (2) heartbeat recovered before eviction -> Ready again, no churn.
-			if !n.Evicted && now.Sub(n.LastSeen) <= c.heartbeatTimeout {
-				c.logger.Printf("node-failure input: node=%s recovered after flap unreachableFor=%s -> Ready (no eviction, no rebuild)",
-					name, now.Sub(n.UnreachableSince))
-				n.Ready = true
-				n.UnreachableSince = time.Time{}
-				continue
+			// (2) Stale heartbeat: mark unreachable on the first crossing only
+			// (flap protection: UnreachableSince is pinned, not re-stamped).
+			// Then fall through — the staleness may already exceed the grace
+			// period (e.g. the detector itself was down), in which case this
+			// same pass should both mark and evict.
+			if n.Ready {
+				n.Ready = false
+				n.UnreachableSince = n.LastSeen.Add(c.heartbeatTimeout)
+				c.logger.Printf("node-failure input: node=%s lastSeen=%s staleFor=%s -> marked Unreachable (grace=%s before eviction)",
+					name, n.LastSeen.Format(time.RFC3339), now.Sub(n.LastSeen), c.evictionGrace)
 			}
 
 			if n.Evicted {
@@ -288,6 +300,8 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 
 			// Evict exactly once: release resources and move pods to
 			// Rescheduling (never delete), so the total stays explainable.
+			// The wait reason is pinned to NodeLost so it stays
+			// distinguishable from a maintenance drain, even after restarts.
 			n.Evicted = true
 			var moved []string
 			for _, p := range st.Pods {
@@ -298,13 +312,14 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 				p.OriginNode = name
 				p.NodeName = ""
 				p.Phase = cluster.PhaseRescheduling
+				p.WaitReason = cluster.WaitReasonNodeLost
 				p.Generation++
 				moved = append(moved, p.UID)
 				evicted = append(evicted, p.UID)
 			}
 			sort.Strings(moved)
-			c.logger.Printf("node-failure decision: node=%s EVICTED unreachableFor=%s podsMoved=%v (Running->Rescheduling; resources released; awaiting reschedule)",
-				name, unreachableFor, moved)
+			c.logger.Printf("node-failure decision: node=%s EVICTED unreachableFor=%s podsMoved=%v (Running->Rescheduling waitReason=%s; resources released; awaiting reschedule)",
+				name, unreachableFor, moved, cluster.WaitReasonNodeLost)
 		}
 		return nil
 	})

@@ -76,11 +76,17 @@ cmd/scheduler/        零依赖本地演示（含虚拟时钟）
 
 驱逐动作：
 
-- Pod **不删除**，只做 `Running -> Rescheduling`，记录 `OriginNode`，并释放节点已用资源；
+- Pod **不删除**，只做 `Running -> Rescheduling`，记录 `OriginNode`，并把
+  `Pod.WaitReason` 置为 `NodeLost`（与维护排干的 `MaintenanceDrain` 可区分，且随
+  状态持久化），同时释放节点已用资源；
 - 随后下一次调谐把这些实例重新调度到健康节点（放不下就停留在 `Rescheduling`，不复制）。
 
 抖动保护：节点在宽限期内恢复心跳（`LastSeen` 重新变新）→ 直接恢复 `Ready`，
 **不驱逐、不重建**，实例零抖动。
+
+确实恢复才上线：已被驱逐的节点只要重新上报心跳，故障检测器就会把它恢复为
+`Ready` 并清除驱逐标记——其上的实例早已迁走，恢复本身不迁移任何东西，因此不会
+重复、不会抖动；反之，只要节点仍然静默，它就永远不会被当成健康。
 
 **实例总数在任意时刻都可解释**：驱逐与重建之间 Pod 始终存在，只是相位从 Running
 变为 Rescheduling，因此恒有
@@ -94,18 +100,24 @@ cmd/scheduler/        零依赖本地演示（含虚拟时钟）
 故障转移处理的是“节点自己掉线”；维护处理的是“人主动把节点摘出去”。两者共用同一
 份持久化状态与“只迁移、不丢失”的实例语义，但触发方式与恢复路径不同。
 
-**进入维护 `Controller.EnterMaintenance(node)`**（单个串行事务内完成）：
+**进入维护 `Controller.EnterMaintenance(node)`**（单个串行事务内完成全部动作）：
 
 1. 置 `Node.Maintenance=true` 并固定 `MaintenanceSince`——随全量状态原子落盘，
    **进程重启后维护标记仍然有效**；
 2. 该节点上所有 `Running` 实例 `Running -> Rescheduling`（记录 `OriginNode`、释放
    资源），与故障驱逐一样**只迁移、不删除**，实例总数在任何时刻都可解释；
-3. 从事务提交起，调度器以 `NodeMaintenance` 拒绝该节点，**新实例不会再落上去**。
+3. **同一事务内立即按确定性规则重新放置这些实例**：能放下的当场迁到健康节点，
+   不需要再额外触发一次调谐才会动；健康节点放不下的实例停留在 `Rescheduling`
+   等待，其逐节点拒绝原因（`NodeMaintenance` vs `InsufficientCPU/Memory`）通过
+   返回的 `DrainResult.WaitErrors` 给出——不丢实例，也不硬塞回放不下的节点；
+4. 从事务提交起，调度器以 `NodeMaintenance` 拒绝该节点，**新实例不会再落上去**。
 
-随后下一次调谐把这些实例按既有的确定性规则（剩余 CPU 最多 → 剩余内存最多 → 名字
-字典序）迁到**健康且放得下**的节点；若健康节点容量不足，实例停留在 `Rescheduling`
-等待，其 `ScheduleError` 的逐节点原因能清楚区分“维护节点被拒”（`NodeMaintenance`）
-与“健康节点放不下”（`InsufficientCPU/Memory`）——不丢实例，也不硬塞回维护节点。
+返回的 `DrainResult` 把一次排干的结果分成三组：`Drained`（本次迁出）、
+`Migrated`（当场重新绑定）、`Waiting`（暂时放不下、等待容量）。
+
+**等待原因可区分、可重启辨认**：每个等待中的实例在 `Pod.WaitReason` 上持久化记录
+等待原因——维护排干为 `MaintenanceDrain`，失联驱逐为 `NodeLost`，绑定成功时清除。
+该字段随状态落盘，进程重启后仍能区分“这个实例为什么在等”。
 
 **幂等与并发**：`EnterMaintenance` 可重复调用（重启后续走进度，已迁走的不会重迁）；
 进入/退出/调谐/故障检测全部串行化在 Store 的单一写锁上，并发触发不会重复迁移或
@@ -113,9 +125,14 @@ cmd/scheduler/        零依赖本地演示（含虚拟时钟）
 
 **退出维护 `Controller.ExitMaintenance(node)`**（单个串行事务）：
 
-- 清除维护标记，节点重新成为调度候选；
-- 同时把 `Ready/LastSeen/Evicted/UnreachableSince` 重置为健康基线——维护期间积累
-  的陈旧心跳历史不会让故障检测器在恢复瞬间误判驱逐；
+- 维护标记总是清除（运维意图生效），但**节点是否重新参与调度取决于它是否确实
+  恢复**，以心跳证据为准：
+  - 心跳新鲜（在 `HeartbeatTimeout` 内）→ 节点确实活着：立即 `Ready` 并清空
+    `UnreachableSince/Evicted`，重新成为调度候选；
+  - 心跳仍旧沉默 → **不当成健康**：保持 `NotReady`，调度器继续以 `NodeNotReady`
+    拒绝它，避免“先把实例放上去、随后又被失联驱逐”的来回搬。节点从退出时刻起
+    重新获得一个完整的驱逐宽限窗口：宽限内真正重新上报心跳，故障检测器就把它
+    恢复为 `Ready`（零抖动）；一直静默则走既有的驱逐路径。
 - **防抖动契约**：恢复**绝不**把 Running 实例迁回该节点。只有未来未绑定的实例
   （新副本、后续驱逐）才可能按确定性规则落上来。再平衡的判断因此稳定可预期：
   运行中的实例永远不因恢复而移动，“刚搬回去又搬走”的来回抖动在设计上不存在。
@@ -123,12 +140,15 @@ cmd/scheduler/        零依赖本地演示（含虚拟时钟）
 **与既有故障处理的关系与兼容范围**：
 
 - 维护中的节点被故障检测器**整体跳过**（不标记不可达、不驱逐），避免与主动维护
-  双重处理；退出维护后故障检测按全新基线重新生效，抖动保护（心跳超时 + 驱逐宽限）
-  语义不变；
+  双重处理；退出维护后故障检测按上述心跳证据重新生效，抖动保护（心跳超时 +
+  驱逐宽限）语义不变；
+- 失联恢复与维护恢复共用同一条“确实恢复才上线”的判定：被驱逐过的节点只有在
+  重新上报心跳后才会重新 `Ready`（其上的实例早已迁走，恢复本身不迁移任何东西），
+  两条路径不互相打架；
 - 维护迁移复用 `Rescheduling` 相位与调谐放置路径，实例总数恒等式
   `Running + Pending + Rescheduling == 期望副本数` 在维护过程中同样成立；
-- 旧版本持久化的状态文件不含维护字段，反序列化后默认为 `false`，等价于无维护，
-  完全向后兼容。
+- 旧版本持久化的状态文件不含维护字段与等待原因字段，反序列化后默认为
+  `false`/`""`，等价于无维护、无等待，完全向后兼容。
 
 ## 五、本地验证方法
 
@@ -155,8 +175,9 @@ cat cluster-state.json   # 查看持久化的全量状态
 
 1. 调谐出 4 个副本并确定性放置；
 2. 5 个协程**并发重复调谐** → 仍是 4 个，无重复；
-3. node-b **进入计划内维护** → web-3 被排干并迁到 node-a，node-b 上实例清零；
-4. node-b **退出维护** → 重新可调度，但已迁走的实例**不会搬回来**（防抖动）；
+3. node-b **进入计划内维护** → web-3 被排干并**当场**迁到 node-a（无需额外触发），
+   node-b 上实例清零；
+4. node-b **退出维护** → 心跳新鲜，重新可调度，但已迁走的实例**不会搬回来**（防抖动）；
 5. node-a 心跳静默 15s（超心跳超时、在驱逐宽限内）→ 仅标记不可达，总数仍 4；
 6. 宽限内调谐 → 不超量创建；
 7. 静默满 30s → 4 个 Pod `Running->Rescheduling` 并重调度，总数恒为 4；
@@ -177,13 +198,17 @@ cat cluster-state.json   # 查看持久化的全量状态
 | 并发调度不超卖 | `TestSchedule_ConcurrentNoOversell`（`-race`） |
 | 重启从持久化状态继续 | `TestReconcile_RestartContinuesFromDisk`、`TestStore_PersistAndReload` |
 | 事务失败回滚 | `TestStore_FailedUpdateRollsBack` |
-| 维护排干并确定性迁移、总数可解释 | `TestMaintenance_DrainMigratesToHealthyNodes` |
+| 维护排干并**当场**确定性迁移、总数可解释 | `TestMaintenance_DrainMigratesToHealthyNodes` |
 | 维护节点拒绝新实例（可区分原因） | `TestSchedule_MaintenanceNodeRejected` |
-| 目标容量放不下时等待且原因可区分 | `TestMaintenance_InsufficientCapacityWaitsWithReason` |
-| 维护标记与进度跨重启持久化 | `TestMaintenance_FlagPersistedAcrossRestart` |
+| 目标容量放不下时等待且原因可区分（含 `WaitReason`） | `TestMaintenance_InsufficientCapacityWaitsWithReason` |
+| 维护标记、进度与等待原因跨重启持久化 | `TestMaintenance_FlagPersistedAcrossRestart` |
 | 恢复后重新参与调度且防抖动 | `TestMaintenance_ExitRejoinsWithoutFlap` |
+| 退出维护时节点仍失联 → 不上线、真实心跳后才上线 | `TestMaintenance_ExitWhileSilentStaysUnschedulable` |
+| 维护等待与失联等待可区分且重启后仍辨认 | `TestMaintenance_WaitReasonDistinctFromFailure` |
 | 维护节点不被故障检测双重处理 | `TestMaintenance_SkippedByFailureDetector` |
+| 被驱逐节点仅在实际心跳后重新上线 | `TestNodeFailure_EvictedNodeRejoinsOnHeartbeat` |
 | 并发维护/恢复/调谐下的一致性 | `TestMaintenance_ConcurrentEnterExitConsistent`（`-race`） |
+| 并发维护/恢复 + 中途重启的一致性 | `TestMaintenance_ConcurrentStormWithRestart`（`-race`） |
 
 所有测试日志通过 `t.Logf` 打印**调度输入**（Pod 请求、容忍、候选节点列表）与
 **判定依据**（每个节点 PASS/REJECT、原因、剩余资源、污点、最终决策规则）。

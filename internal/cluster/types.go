@@ -48,6 +48,22 @@ type Toleration struct {
 	Effect   string `json:"effect"` // empty matches any effect
 }
 
+// WaitReason explains why an unbound pod is currently waiting for a node.
+// It is persisted with the pod, so the cause of a wait stays distinguishable
+// across process restarts.
+type WaitReason string
+
+const (
+	// WaitReasonNone means the pod is not waiting (bound, or never evicted).
+	WaitReasonNone WaitReason = ""
+	// WaitReasonMaintenanceDrain means the pod was drained off its node by
+	// planned, operator-initiated maintenance and awaits a new binding.
+	WaitReasonMaintenanceDrain WaitReason = "MaintenanceDrain"
+	// WaitReasonNodeLost means the pod was evicted because its node went
+	// unreachable past the eviction grace period.
+	WaitReasonNodeLost WaitReason = "NodeLost"
+)
+
 // PodPhase is the lifecycle phase of a pod instance.
 type PodPhase string
 
@@ -97,7 +113,11 @@ type Pod struct {
 	Phase       PodPhase     `json:"phase"`
 	NodeName    string       `json:"nodeName,omitempty"`
 	// OriginNode records the node a Rescheduling pod was evicted from.
-	OriginNode string    `json:"originNode,omitempty"`
+	OriginNode string `json:"originNode,omitempty"`
+	// WaitReason records WHY an unbound pod is waiting: drained by planned
+	// maintenance vs evicted by a node failure. Persisted, so the distinction
+	// survives process restarts; cleared when the pod is bound again.
+	WaitReason WaitReason `json:"waitReason,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 	// Generation bumps on every state transition; helps make decisions explainable.
 	Generation int `json:"generation"`

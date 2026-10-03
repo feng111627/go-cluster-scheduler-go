@@ -335,3 +335,85 @@ func TestNodeFailure_EvictionAndReschedule(t *testing.T) {
 		t.Fatalf("repeated detection total = %d, want 4", total)
 	}
 }
+
+// A node that was evicted after the grace period rejoins scheduling ONLY
+// when it verifiably heartbeats again — recovery moves nothing (its pods
+// were already migrated), so there is no churn and no duplication.
+func TestNodeFailure_EvictedNodeRejoinsOnHeartbeat(t *testing.T) {
+	f := newFixture(t, "")
+	f.addNode(t, "n1", 8000, 8192)
+	f.addNode(t, "n2", 8000, 8192)
+	f.addDeployment(t, "web", 4, 1000, 512)
+	mustReconcile(t, f.ctl, "web")
+
+	// n1 goes silent past the grace period -> evicted once.
+	f.clk.advance(45 * time.Second)
+	f.st.HeartbeatAt("n2", f.clk.now())
+	ev, err := f.ctl.DetectNodeFailures()
+	if err != nil || len(ev) == 0 {
+		t.Fatalf("evicted=%v err=%v, want non-empty", ev, err)
+	}
+	mustReconcile(t, f.ctl, "web")
+	counts, total := f.phaseCount(t)
+	if total != 4 || counts[cluster.PhaseRunning] != 4 {
+		t.Fatalf("counts=%v total=%d, want 4 running after failover", counts, total)
+	}
+	var evictedFlag bool
+	f.st.View(func(s *cluster.State) { evictedFlag = s.Nodes["n1"].Evicted })
+	if !evictedFlag {
+		t.Fatal("n1 should be marked evicted")
+	}
+
+	// While n1 stays silent it must NOT come back, no matter how often we
+	// detect or reconcile.
+	f.clk.advance(60 * time.Second)
+	f.st.HeartbeatAt("n2", f.clk.now())
+	if _, err := f.ctl.DetectNodeFailures(); err != nil {
+		t.Fatal(err)
+	}
+	f.st.View(func(s *cluster.State) {
+		if s.Nodes["n1"].Ready {
+			t.Fatal("silent evicted node must not become Ready again")
+		}
+	})
+
+	// n1 verifiably reports again -> the next detection pass makes it Ready
+	// and clears the eviction mark; nothing is migrated back (anti-flap).
+	f.st.HeartbeatAt("n1", f.clk.now())
+	ev, err = f.ctl.DetectNodeFailures()
+	if err != nil || len(ev) != 0 {
+		t.Fatalf("recovery pass evicted=%v err=%v, want none", ev, err)
+	}
+	f.st.View(func(s *cluster.State) {
+		n1 := s.Nodes["n1"]
+		if !n1.Ready || n1.Evicted {
+			t.Fatalf("recovered node: ready=%t evicted=%t, want ready/not-evicted", n1.Ready, n1.Evicted)
+		}
+	})
+	res := mustReconcile(t, f.ctl, "web")
+	if len(res.Bound) != 0 || len(res.Created) != 0 {
+		t.Fatalf("recovery reconcile churn: bound=%v created=%v, want none", res.Bound, res.Created)
+	}
+
+	// New replicas may now land on the rejoined node (it has 4000m free).
+	if err := f.st.ScaleDeployment("web", 6); err != nil {
+		t.Fatal(err)
+	}
+	mustReconcile(t, f.ctl, "web")
+	var onN1 int
+	f.st.View(func(s *cluster.State) {
+		for _, p := range s.Pods {
+			if p.NodeName == "n1" && p.Phase == cluster.PhaseRunning {
+				onN1++
+			}
+		}
+	})
+	if onN1 != 2 {
+		t.Fatalf("pods on rejoined n1 = %d, want 2 new replicas", onN1)
+	}
+	_, total = f.phaseCount(t)
+	if total != 6 {
+		t.Fatalf("total = %d, want 6", total)
+	}
+	t.Logf("evicted node rejoined only after real heartbeat; zero churn, total stable")
+}

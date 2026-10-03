@@ -108,21 +108,22 @@ func run(stateFile string, logger *log.Logger) error {
 	}
 	printCounts(logger, st)
 
-	// 3) Planned maintenance on node-b: drain it (web-3 migrates to node-a),
-	// then bring it back and show that nothing flaps back and forth.
-	logger.Printf("==== STEP 3: planned maintenance on node-b (drain + migrate) ====")
-	drained, err := ctl.EnterMaintenance("node-b")
+	// 3) Planned maintenance on node-b: drain it and migrate its pods in the
+	// SAME operation (no extra trigger), then bring it back and show that
+	// nothing flaps back and forth.
+	logger.Printf("==== STEP 3: planned maintenance on node-b (drain + immediate migration) ====")
+	dr, err := ctl.EnterMaintenance("node-b")
 	if err != nil {
 		return err
 	}
-	logger.Printf("drained pods off node-b: %v", drained)
-	if err := reconcile(ctl, "web"); err != nil {
+	logger.Printf("drain of node-b: drained=%v migrated=%v waiting=%v", dr.Drained, dr.Migrated, dr.Waiting)
+	if err := reconcile(ctl, "web"); err != nil { // no-op: migration already done
 		return err
 	}
 	printCounts(logger, st)
 	logPodsOnNode(logger, st, "node-b") // must be empty
 
-	logger.Printf("==== STEP 4: node-b exits maintenance (rejoin, no move-back flap) ====")
+	logger.Printf("==== STEP 4: node-b exits maintenance (heartbeat fresh -> rejoin, no move-back flap) ====")
 	if err := ctl.ExitMaintenance("node-b"); err != nil {
 		return err
 	}

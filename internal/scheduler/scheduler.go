@@ -244,6 +244,7 @@ func (sc *Scheduler) PlaceInState(st *cluster.State, podUID string) error {
 	chosen.node.Used = chosen.node.Used.Add(pod.Requests)
 	pod.NodeName = chosen.node.Name
 	pod.OriginNode = ""
+	pod.WaitReason = cluster.WaitReasonNone // bound again: no longer waiting
 	pod.Phase = cluster.PhaseRunning
 	pod.Generation++
 
