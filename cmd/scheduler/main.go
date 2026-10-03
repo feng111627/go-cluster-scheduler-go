@@ -108,27 +108,76 @@ func run(stateFile string, logger *log.Logger) error {
 	}
 	printCounts(logger, st)
 
-	// 3) Planned maintenance on node-b: drain it (web-3 migrates to node-a),
+	// 3) Planned maintenance on node-b: drain AND migrate in one call
+	// (web-3 migrates to node-a immediately, no extra reconcile needed),
 	// then bring it back and show that nothing flaps back and forth.
-	logger.Printf("==== STEP 3: planned maintenance on node-b (drain + migrate) ====")
-	drained, err := ctl.EnterMaintenance("node-b")
+	logger.Printf("==== STEP 3: planned maintenance on node-b (drain + migrate in one shot) ====")
+	mres, err := ctl.EnterMaintenance("node-b")
 	if err != nil {
 		return err
 	}
-	logger.Printf("drained pods off node-b: %v", drained)
+	logger.Printf("node-b maintenance: drained=%v migrated=%v waiting=%v", mres.Drained, mres.Migrated, mres.Waiting)
+	printCounts(logger, st)
+	logPodsOnNode(logger, st, "node-b") // must be empty
+
+	logger.Printf("==== STEP 4: node-b exits maintenance with a fresh heartbeat (rejoin, no move-back flap) ====")
+	rejoined, err := ctl.ExitMaintenance("node-b")
+	if err != nil {
+		return err
+	}
+	logger.Printf("node-b rejoined scheduling: %t", rejoined)
 	if err := reconcile(ctl, "web"); err != nil {
 		return err
 	}
 	printCounts(logger, st)
-	logPodsOnNode(logger, st, "node-b") // must be empty
 
-	logger.Printf("==== STEP 4: node-b exits maintenance (rejoin, no move-back flap) ====")
-	if err := ctl.ExitMaintenance("node-b"); err != nil {
+	// 4b) Gated recovery: a node that is STILL silent when asked back must not
+	// be treated as healthy — it rejoins only after a real heartbeat.
+	logger.Printf("==== STEP 4b: maintenance on node-b again, but it stays silent -> exit does NOT mark it healthy ====")
+	if _, err := ctl.EnterMaintenance("node-b"); err != nil {
 		return err
 	}
-	if err := reconcile(ctl, "web"); err != nil {
+	clk.advance(15 * time.Second) // node-b never heartbeats: past heartbeat timeout
+	healthyHeartbeat(st, clk, "node-a", "node-c")
+	rejoined, err = ctl.ExitMaintenance("node-b")
+	if err != nil {
 		return err
 	}
+	logger.Printf("node-b rejoined while silent: %t (want false — stays unschedulable)", rejoined)
+	// A new workload must NOT land on the silently-returned node: node-a is
+	// full, node-c is tainted, node-b is NotReady -> probe stays Pending with
+	// a distinguishable NodeNotReady reason for node-b.
+	probe := &cluster.Deployment{
+		Name:      "probe",
+		Namespace: "default",
+		Replicas:  1,
+		Template: cluster.PodTemplate{
+			NamePrefix: "probe",
+			Requests:   cluster.Resources{CPU: mCPU(1000), Memory: 512},
+		},
+	}
+	if err := st.UpsertDeployment(probe); err != nil {
+		return err
+	}
+	if err := reconcileRaw(ctl, "probe"); err != nil {
+		var rerr *controller.ReconcileError
+		if !errors.As(err, &rerr) {
+			return err
+		}
+		for _, se := range rerr.ScheduleErrors {
+			logger.Printf("probe unschedulable as expected, per-node reasons: %v", se.Failures)
+		}
+	}
+	logPodsOnNode(logger, st, "node-b") // must still be empty
+	logger.Printf("node-b heartbeats again -> failure detector restores it to Ready")
+	healthyHeartbeat(st, clk, "node-b")
+	if _, err := ctl.DetectNodeFailures(); err != nil {
+		return err
+	}
+	if err := reconcile(ctl, "probe"); err != nil {
+		return err
+	}
+	logPodsOnNode(logger, st, "node-b") // now the probe may land here
 	printCounts(logger, st)
 
 	// 4) node-a loses heartbeats: at first only Unreachable (grace), then evicted.
@@ -200,7 +249,7 @@ func run(stateFile string, logger *log.Logger) error {
 	}
 	sch2 := scheduler.New(st2, logger)
 	ctl2 := controller.NewWithClock(st2, sch2, cfg, logger, clk.now)
-	for _, d := range []string{"web", "batch"} {
+	for _, d := range []string{"web", "probe", "batch"} {
 		if err := reconcile(ctl2, d); err != nil && !errors.As(err, &rerr) {
 			return err
 		}

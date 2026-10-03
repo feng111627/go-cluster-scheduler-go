@@ -274,8 +274,21 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 				continue
 			}
 
+			// (2b) an already-evicted node whose heartbeat is fresh again is
+			// genuinely back: let it rejoin scheduling. Its pods were moved
+			// off long ago and are NOT moved back (anti-flap); only future
+			// placements land here. This is also the path by which a node
+			// that exited maintenance while still silent rejoins once it
+			// actually recovers.
 			if n.Evicted {
-				continue // already moved pods off; idempotent
+				if now.Sub(n.LastSeen) <= c.heartbeatTimeout {
+					c.logger.Printf("node-failure input: node=%s heartbeat fresh again after eviction -> Ready, rejoins scheduling (no pods moved back)",
+						name)
+					n.Evicted = false
+					n.Ready = true
+					n.UnreachableSince = time.Time{}
+				}
+				continue // eviction itself is idempotent; never evict twice
 			}
 
 			// (3) unreachable for less than the grace period -> keep waiting.
@@ -288,6 +301,8 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 
 			// Evict exactly once: release resources and move pods to
 			// Rescheduling (never delete), so the total stays explainable.
+			// WaitReason=NodeFailure keeps this wait distinguishable from a
+			// planned-maintenance drain, persisted across restarts.
 			n.Evicted = true
 			var moved []string
 			for _, p := range st.Pods {
@@ -296,6 +311,7 @@ func (c *Controller) DetectNodeFailures() ([]string, error) {
 				}
 				n.Used = n.Used.Sub(p.Requests)
 				p.OriginNode = name
+				p.WaitReason = cluster.WaitNodeFailure
 				p.NodeName = ""
 				p.Phase = cluster.PhaseRescheduling
 				p.Generation++

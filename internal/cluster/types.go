@@ -62,6 +62,18 @@ const (
 	PhaseFailed PodPhase = "Failed"
 )
 
+// WaitReason explains why a Rescheduling pod is waiting for a new binding.
+// It is persisted with the pod, so the cause of the wait stays distinguishable
+// (planned maintenance vs. node failure) even across process restarts.
+type WaitReason string
+
+const (
+	// WaitMaintenanceDrain: pod was drained off a node by planned maintenance.
+	WaitMaintenanceDrain WaitReason = "MaintenanceDrain"
+	// WaitNodeFailure: pod was evicted because its node was declared lost.
+	WaitNodeFailure WaitReason = "NodeFailure"
+)
+
 // Node is a simulated worker machine.
 type Node struct {
 	Name     string            `json:"name"`
@@ -97,8 +109,11 @@ type Pod struct {
 	Phase       PodPhase     `json:"phase"`
 	NodeName    string       `json:"nodeName,omitempty"`
 	// OriginNode records the node a Rescheduling pod was evicted from.
-	OriginNode string    `json:"originNode,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
+	OriginNode string `json:"originNode,omitempty"`
+	// WaitReason records WHY a Rescheduling pod is waiting (maintenance drain
+	// vs. node failure). Persisted; cleared when the pod is bound again.
+	WaitReason WaitReason `json:"waitReason,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
 	// Generation bumps on every state transition; helps make decisions explainable.
 	Generation int `json:"generation"`
 }
